@@ -7,7 +7,7 @@ plugins {
 
 android {
     namespace = "com.proxydroid"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.proxydroid"

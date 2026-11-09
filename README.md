@@ -36,7 +36,7 @@ Android VPN-приложение с встроенным `socks5_proxy.py`: пр
 
 ## Сборка
 
-Нужны Android Studio или Android SDK Platform 35, JDK 17 и Gradle Wrapper. В корне проекта:
+Для сборки нужен Android SDK Platform 36 (compile SDK), JDK 17 и Gradle Wrapper. `targetSdk` остаётся 35; повышение `compileSdk` нужно только для сборки с актуальными AndroidX-зависимостями. В корне проекта:
 
 ```bash
 ./gradlew :app:assembleDebug
