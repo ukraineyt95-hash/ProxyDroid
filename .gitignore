@@ -1,0 +1,11 @@
+# Gradle / Android Studio
+.gradle/
+**/build/
+local.properties
+.idea/
+*.iml
+
+# Python test/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
