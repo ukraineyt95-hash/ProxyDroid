@@ -61,8 +61,8 @@ jobs:
           echo "ANDROID_HOME=$RUNNER_TEMP/android-sdk" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$RUNNER_TEMP/android-sdk" >> "$GITHUB_ENV"
 
-      - name: Install Android SDK Platform 35
-        run: android --sdk="$ANDROID_HOME" sdk install platforms/android-35 build-tools/35.0.0 platform-tools
+      - name: Install Android SDK Platform 36
+        run: android --sdk="$ANDROID_HOME" sdk install platforms/android-36 build-tools/35.0.0 platform-tools
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
