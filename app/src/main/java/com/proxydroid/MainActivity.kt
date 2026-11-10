@@ -574,6 +574,66 @@ private fun SettingsScreen(
             )
         }
 
+        SettingsSection("TCP · НАСТРОЙКА ПЕРЕДАЧИ") {
+            SwitchSetting(
+                title = "Микросегментация TCP",
+                description = "Ограничивает TCP MSS исходящих сокетов и виртуального TUN-потока. Ядро может скорректировать значение; границы write() не гарантируют границы сетевых пакетов.",
+                checked = settings.tcpMicroSegmentation,
+                enabled = enabled,
+                onCheckedChange = { onSettingsChange(settings.copy(tcpMicroSegmentation = it)) },
+            )
+            if (settings.tcpMicroSegmentation) {
+                SettingsField(
+                    label = "TCP MSS · байт",
+                    value = settings.tcpSegmentSize,
+                    hint = "256–1460; типичное значение 512.",
+                    enabled = enabled,
+                    keyboardType = KeyboardType.Number,
+                    onValueChange = { onSettingsChange(settings.copy(tcpSegmentSize = it)) },
+                )
+            }
+            SwitchSetting(
+                title = "Фрагментация TLS ClientHello",
+                description = "Разбивает первое TLS ClientHello на несколько TLS handshake records. Это не гарантирует отдельные TCP-пакеты; применяется к TCP/TLS, не к QUIC.",
+                checked = settings.fragmentTlsClientHello,
+                enabled = enabled,
+                onCheckedChange = { onSettingsChange(settings.copy(fragmentTlsClientHello = it)) },
+            )
+            if (settings.fragmentTlsClientHello) {
+                SettingsField(
+                    label = "Размер TLS-фрагмента · байт",
+                    value = settings.tlsFragmentSize,
+                    hint = "64–1024; типичное значение 128.",
+                    enabled = enabled,
+                    keyboardType = KeyboardType.Number,
+                    onValueChange = { onSettingsChange(settings.copy(tlsFragmentSize = it)) },
+                )
+            }
+            SwitchSetting(
+                title = "Подмена SNI",
+                description = "Меняет только server_name в первом полном TLS ClientHello. Это не направляет соединение через Cloudflare и может вызвать ошибку сертификата; ECH и TLS 1.3 PSK-resumption пропускаются.",
+                checked = settings.sniOverrideEnabled,
+                enabled = enabled,
+                onCheckedChange = { onSettingsChange(settings.copy(sniOverrideEnabled = it)) },
+            )
+            if (settings.sniOverrideEnabled) {
+                SettingsField(
+                    label = "SNI · DNS-имя",
+                    value = settings.sniOverride,
+                    hint = "Например www.cloudflare.com. Только имя хоста; это не включает Cloudflare-прокси.",
+                    enabled = enabled,
+                    onValueChange = { onSettingsChange(settings.copy(sniOverride = it)) },
+                )
+            }
+            SwitchSetting(
+                title = "TCP Fast Open (TFO)",
+                description = "Пробует отправлять первые байты в SYN. TFO может повторно доставить начальные данные; включайте только если это допустимо для используемого протокола. Без поддержки остаётся обычное TCP.",
+                checked = settings.tcpFastOpen,
+                enabled = enabled,
+                onCheckedChange = { onSettingsChange(settings.copy(tcpFastOpen = it)) },
+            )
+        }
+
         if (settings.hasNoAuthentication()) {
             InfoCard(
                 if (settings.isExposedWithoutAuthentication()) {

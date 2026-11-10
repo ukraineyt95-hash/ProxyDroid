@@ -25,6 +25,11 @@ Android VPN-приложение с встроенным `socks5_proxy.py`: пр
 
 - Дополнительно есть необязательный внешний SOCKS5 для маршрута TUN. Если поле пустое, TUN использует встроенный прокси. Если задано — локальный сервер продолжает работать, а трафик устройства направляется через внешний SOCKS5. Логин и пароль upstream задаются отдельно от адреса и также хранятся зашифрованно.
 - В настройках есть переключатель **UDP-over-TCP**. Для него реализовано парное расширение SOCKS5: команда `0x80`, далее кадры `4-byte length + SOCKS address + UDP payload`. Это не стандарт SOCKS5; удалённый upstream должен поддерживать то же расширение. Встроенный сервер ProxyDroid его поддерживает. Обычный SOCKS5 UDP ASSOCIATE остаётся режимом по умолчанию.
+- Дополнительные TCP-настройки выключены по умолчанию:
+  - **Микросегментация TCP** задаёт `TCP_MAXSEG` для исходящих сокетов (насколько это поддерживает Android/Linux kernel) и ограничивает MSS виртуального TCP-потока TUN. Ядро и сеть могут изменить фактическую сегментацию; вызовы `write()` сами по себе не задают границы TCP-пакетов.
+  - **Фрагментация TLS ClientHello** делит полное первое сообщение ClientHello на несколько смежных TLS handshake records. Она применяется только к TCP/TLS-потокам; уже фрагментированные/нестандартные ClientHello и QUIC не изменяются. TLS-уровневые records не равны TCP-пакетам.
+  - **Подмена SNI** заменяет только `server_name` в первом полном ClientHello и пересчитывает длины TLS-полей. Она не меняет IP-адрес, HTTP Host и маршрут: одно лишь значение SNI не превращает произвольный сервер в Cloudflare-прокси. Сервер может выбрать другой сертификат, из-за чего проверка сертификата клиентом завершится ошибкой. При ECH или TLS 1.3 PSK-resumption подмена не выполняется; уже фрагментированные ClientHello не изменяются.
+  - **TCP Fast Open** включается best-effort на исходящих сокетах через `TCP_FASTOPEN_CONNECT`; поддержка зависит от ядра и удалённого узла. Без подходящего TFO cookie соединение использует обычный TCP handshake. Начальные данные в SYN в редких случаях могут быть доставлены повторно, поэтому переключатель выключен по умолчанию и его следует включать только если используемый протокол переносит повторы. При внешнем SOCKS5 TFO относится к соединению с самим SOCKS-сервером, а не обязательно к соединению от него до конечного узла.
 
 ## Безопасность и границы
 
@@ -51,12 +56,18 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile app/src/main/python/*.py
 ```
 
-Проверяются UDP-over-TCP SOCKS-расширение, его использование TUN-движком, локальная переадресация DNS-пакетов и запуск/остановка runner с тестовым TUN-дескриптором.
+Проверяются UDP-over-TCP SOCKS-расширение, его использование TUN-движком, локальная переадресация DNS-пакетов, запуск/остановка runner с тестовым TUN-дескриптором, разбиение ClientHello на TLS records, переписывание SNI и создание исходящего TCP-сокета с включённой best-effort настройкой TFO.
 
 ## Справочные материалы
 
 - Android VPN guide: <https://developer.android.com/develop/connectivity/vpn>
 - Chaquopy Android setup: <https://chaquo.com/chaquopy/doc/current/android.html>
+- SNI extension (RFC 6066): <https://www.rfc-editor.org/rfc/rfc6066.html>
+- TCP segmentation behavior (RFC 9293): <https://www.rfc-editor.org/rfc/rfc9293.html>
+- TLS 1.3 record-layer fragmentation (RFC 8446): <https://www.rfc-editor.org/rfc/rfc8446.html>
+- TCP Fast Open (RFC 7413): <https://www.rfc-editor.org/rfc/rfc7413.html>
+- Cloudflare proxy port support: <https://developers.cloudflare.com/fundamentals/reference/network-ports/>
+- Cloudflare proxy eligibility/limitations: <https://developers.cloudflare.com/dns/proxy-status/limitations/>
 
 ## Лицензия
 

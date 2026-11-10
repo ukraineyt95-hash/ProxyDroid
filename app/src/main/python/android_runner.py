@@ -134,12 +134,23 @@ async def _serve(fd, config):
     fake_ip_range = str(config.get("fakeIpRange", "198.18.0.0/15")).strip()
     print_cert = bool(config.get("printCert", False))
     udp_over_tcp = bool(config.get("udpOverTcp", False))
+    tcp_max_segment_size = int(config.get("tcpMaxSegmentSize", 0) or 0)
+    tcp_fast_open = bool(config.get("tcpFastOpen", False))
+    fragment_client_hello = bool(config.get("fragmentClientHello", False))
+    tls_fragment_size = int(config.get("tlsFragmentSize", 128) or 128)
+    sni_override = str(config.get("sniOverride", "") or "").strip()
 
     if (username is None) != (password is None):
         raise ValueError("SOCKS5 username and password must be set together")
     if (upstream_username is None) != (upstream_password is None):
         raise ValueError("upstream SOCKS5 username and password must be set together")
 
+    proxy.configure_transport_options(
+        tcp_max_segment_size=tcp_max_segment_size,
+        tcp_fast_open=tcp_fast_open,
+        tls_client_hello_fragmentation=fragment_client_hello,
+        tls_fragment_size=tls_fragment_size,
+    )
     proxy.configure_performance()
     proxy.configure_mkcp()
     proxy.configure_pac()
@@ -184,6 +195,10 @@ async def _serve(fd, config):
             tunnel_password,
             udp_over_tcp=udp_over_tcp,
             dns_redirect=(_dns_loopback_for(dns_host), dns_port),
+            tcp_max_segment_size=tcp_max_segment_size,
+            fragment_client_hello=fragment_client_hello,
+            tls_fragment_size=tls_fragment_size,
+            sni_override=sni_override,
         )
 
         for transport in transports:

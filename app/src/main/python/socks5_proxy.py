@@ -7,10 +7,12 @@ import fnmatch
 import hashlib
 import ipaddress
 import os
+import re
 import secrets
 import socket
 import ssl
 import struct
+import sys
 import tempfile
 import time
 from urllib.parse import unquote, urlsplit
@@ -54,6 +56,16 @@ MUX_CONN_GRANT = 1 << 30
 WINDOW_REFRESH = RELAY_CHUNK
 SOCK_BUF = 0
 
+TCP_MAXSEG_OPTION = getattr(
+    socket, "TCP_MAXSEG", 2 if sys.platform.startswith("linux") else None)
+TCP_FASTOPEN_CONNECT_OPTION = getattr(
+    socket, "TCP_FASTOPEN_CONNECT", 30 if sys.platform.startswith("linux") else None)
+TCP_MICROSEGMENT_SIZE = 0
+TCP_FAST_OPEN = False
+TLS_CLIENT_HELLO_FRAGMENTATION = False
+TLS_CLIENT_HELLO_FRAGMENT_SIZE = 128
+_SOCKET_OPTION_WARNINGS = set()
+
 MKCP_MTU = 1350
 MKCP_TTI = 20
 MKCP_UPLINK = 50
@@ -77,16 +89,66 @@ def tune_connection(writer):
     sock = writer.get_extra_info("socket")
     if sock is None:
         return
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    except (AttributeError, OSError):
-        pass
+    for level, option, value in (
+        (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    ):
+        try:
+            sock.setsockopt(level, option, value)
+        except (AttributeError, OSError, ValueError):
+            pass
     if hasattr(socket, "TCP_QUICKACK"):
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
-        except OSError:
+        except (OSError, ValueError):
             pass
+
+
+def _warn_socket_option_once(name, error):
+    if name in _SOCKET_OPTION_WARNINGS:
+        return
+    _SOCKET_OPTION_WARNINGS.add(name)
+    print(f"ProxyDroid: {name} is unavailable; continuing with OS defaults ({error})",
+          flush=True)
+
+
+def _prepare_tcp_socket(sock):
+    if TCP_MICROSEGMENT_SIZE:
+        if TCP_MAXSEG_OPTION is None:
+            _warn_socket_option_once("TCP_MAXSEG", "socket option is not exposed by this platform")
+        else:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, TCP_MAXSEG_OPTION, TCP_MICROSEGMENT_SIZE)
+            except (AttributeError, OSError, ValueError) as exc:
+                _warn_socket_option_once("TCP_MAXSEG", exc)
+    if TCP_FAST_OPEN:
+        if TCP_FASTOPEN_CONNECT_OPTION is None:
+            _warn_socket_option_once(
+                "TCP Fast Open", "TCP_FASTOPEN_CONNECT is not exposed by this platform")
+        else:
+            try:
+                # This must be set before connect(); on Linux it is best-effort and
+                # falls back to a regular handshake if the kernel/peer has no cookie.
+                sock.setsockopt(socket.IPPROTO_TCP, TCP_FASTOPEN_CONNECT_OPTION, 1)
+            except (AttributeError, OSError, ValueError) as exc:
+                _warn_socket_option_once("TCP Fast Open", exc)
+
+
+def configure_transport_options(tcp_max_segment_size=0, tcp_fast_open=False,
+                                tls_client_hello_fragmentation=False,
+                                tls_fragment_size=128):
+    global TCP_MICROSEGMENT_SIZE, TCP_FAST_OPEN
+    global TLS_CLIENT_HELLO_FRAGMENTATION, TLS_CLIENT_HELLO_FRAGMENT_SIZE
+    tcp_max_segment_size = int(tcp_max_segment_size)
+    tls_fragment_size = int(tls_fragment_size)
+    if tcp_max_segment_size and not 256 <= tcp_max_segment_size <= 1460:
+        raise ValueError("TCP max segment size must be 0 or between 256 and 1460 bytes")
+    if not 64 <= tls_fragment_size <= 1024:
+        raise ValueError("TLS ClientHello fragment size must be between 64 and 1024 bytes")
+    TCP_MICROSEGMENT_SIZE = tcp_max_segment_size
+    TCP_FAST_OPEN = bool(tcp_fast_open)
+    TLS_CLIENT_HELLO_FRAGMENTATION = bool(tls_client_hello_fragmentation)
+    TLS_CLIENT_HELLO_FRAGMENT_SIZE = tls_fragment_size
 
 
 def configure_performance(chunk=262144, frame_size=65536, window=1 << 20,
@@ -890,12 +952,39 @@ def parse_udp_address(data, offset):
     return host, port, offset + 2
 
 
+async def open_tcp_connection(host, port, timeout=20):
+    """Open an outgoing TCP stream with optional per-socket tuning."""
+    loop = asyncio.get_running_loop()
+    deadline = time.monotonic() + timeout
+    infos = await asyncio.wait_for(
+        loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=timeout)
+    last_error = None
+    for family, socktype, proto, _, sockaddr in infos:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.setblocking(False)
+            _prepare_tcp_socket(sock)
+            # Keep one unreachable address from delaying the next candidate for
+            # the entire connection timeout (common on mobile IPv6 networks).
+            await asyncio.wait_for(loop.sock_connect(sock, sockaddr),
+                                   timeout=min(5.0, remaining))
+            reader, writer = await asyncio.open_connection(sock=sock, limit=READER_LIMIT)
+            tune_connection(writer)
+            return reader, writer
+        except (OSError, asyncio.TimeoutError, ValueError) as exc:
+            last_error = exc
+            sock.close()
+    if last_error is not None:
+        raise last_error
+    raise asyncio.TimeoutError("TCP connection timed out")
+
+
 async def open_remote(host, port, timeout=20):
     host = resolve_fake_target(host)
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host, port, limit=READER_LIMIT), timeout=timeout)
-    tune_connection(writer)
-    return reader, writer
+    return await open_tcp_connection(host, port, timeout=timeout)
 
 
 def close_writer(writer):
@@ -1537,9 +1626,7 @@ def parse_proxy_url(value, username=None, password=None):
 async def socks5_client_handshake(host, port, username=None, password=None, timeout=20):
     reader = writer = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, limit=READER_LIMIT), timeout)
-        tune_connection(writer)
+        reader, writer = await open_tcp_connection(host, port, timeout=timeout)
         methods = b"\x00\x02" if username is not None else b"\x00"
         writer.write(b"\x05" + bytes([len(methods)]) + methods)
         await writer.drain()
@@ -2035,6 +2122,218 @@ class TunDnsFlow:
         await self.disconnect()
 
 
+def normalize_sni_override(value):
+    if value is None or not str(value).strip():
+        return None
+    hostname = str(value).strip().rstrip(".")
+    try:
+        encoded = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError("SNI must be a valid DNS hostname") from exc
+    labels = encoded.split(".")
+    label_pattern = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+    try:
+        ipaddress.ip_address(encoded)
+    except ValueError:
+        is_ip_address = False
+    else:
+        is_ip_address = True
+    if (len(encoded) > 253 or not labels or is_ip_address or
+            any(not label_pattern.fullmatch(label) for label in labels)):
+        raise ValueError("SNI must be a valid DNS hostname (without scheme, port, or IP address)")
+    return encoded
+
+
+class TLSClientHelloProcessor:
+    """Optionally rewrite SNI and/or split the first complete ClientHello."""
+
+    MAX_RECORD_SIZE = 16384
+    MAX_RECORDS = 32
+
+    def __init__(self, fragment_size=128, fragment=True, sni_override=None):
+        if not 64 <= int(fragment_size) <= 1024:
+            raise ValueError("TLS ClientHello fragment size must be between 64 and 1024 bytes")
+        self.fragment_size = int(fragment_size)
+        self.fragment = bool(fragment)
+        self.sni_override = normalize_sni_override(sni_override)
+        self.buffer = bytearray()
+        self.done = False
+
+    @property
+    def pending(self):
+        return bool(self.buffer) and not self.done
+
+    def feed(self, data):
+        if self.done:
+            return bytes(data)
+        self.buffer.extend(data)
+        if not self.buffer:
+            return b""
+        if self.buffer[0] != 22:
+            return self._pass_through()
+        if len(self.buffer) < 5:
+            return b""
+        if self.buffer[1] != 3:
+            return self._pass_through()
+        record_size = struct.unpack_from("!H", self.buffer, 3)[0]
+        if record_size < 4 or record_size > self.MAX_RECORD_SIZE:
+            return self._pass_through()
+        total_size = 5 + record_size
+        if len(self.buffer) < total_size:
+            return b""
+
+        record = bytes(self.buffer[:total_size])
+        trailing = bytes(self.buffer[total_size:])
+        self.buffer.clear()
+        handshake = record[5:]
+        if handshake[0] != 1:
+            self.done = True
+            return record + trailing
+        hello_size = int.from_bytes(handshake[1:4], "big")
+        if 4 + hello_size != len(handshake):
+            # It may already be fragmented or contain another handshake message.
+            # Leave such streams untouched rather than guessing at TLS framing.
+            self.done = True
+            return record + trailing
+
+        transformed = handshake
+        if self.sni_override is not None:
+            rewritten = self._rewrite_sni(handshake, self.sni_override.encode("ascii"))
+            if rewritten is not None and len(rewritten) <= self.MAX_RECORD_SIZE:
+                transformed = rewritten
+
+        version = record[1:3]
+        if not self.fragment:
+            output = (b"\x16" + version + struct.pack("!H", len(transformed)) + transformed
+                      if transformed != handshake else record)
+            self.done = True
+            return output + trailing
+
+        part_size = max(self.fragment_size,
+                        (len(transformed) + self.MAX_RECORDS - 1) // self.MAX_RECORDS)
+        if part_size >= len(transformed):
+            part_size = max(1, len(transformed) // 2)
+        fragments = [transformed[offset:offset + part_size]
+                     for offset in range(0, len(transformed), part_size)]
+        if len(fragments) < 2:
+            self.done = True
+            return record + trailing
+        output = bytearray()
+        continuation_version = (
+            b"\x03\x03" if handshake[4:6] >= b"\x03\x03" else version)
+        for index, fragment in enumerate(fragments):
+            # Keep the initial record's version; use TLS 1.2's record-layer
+            # value for continuation records when the ClientHello supports it.
+            record_version = version if index == 0 else continuation_version
+            output.extend(b"\x16" + record_version + struct.pack("!H", len(fragment)))
+            output.extend(fragment)
+        self.done = True
+        return bytes(output) + trailing
+
+    @staticmethod
+    def _rewrite_sni(handshake, replacement):
+        if len(handshake) < 4 or handshake[0] != 1:
+            return None
+        if int.from_bytes(handshake[1:4], "big") != len(handshake) - 4:
+            return None
+        hello = handshake[4:]
+        if len(hello) < 35:
+            return None
+        offset = 34  # legacy_version + random
+        session_size = hello[offset]
+        offset += 1
+        if session_size > 32 or offset + session_size + 2 > len(hello):
+            return None
+        offset += session_size
+        cipher_size = struct.unpack_from("!H", hello, offset)[0]
+        offset += 2
+        if cipher_size < 2 or cipher_size & 1 or offset + cipher_size + 1 > len(hello):
+            return None
+        offset += cipher_size
+        compression_size = hello[offset]
+        offset += 1
+        if compression_size < 1 or offset + compression_size + 2 > len(hello):
+            return None
+        offset += compression_size
+        extension_length_offset = offset
+        extension_size = struct.unpack_from("!H", hello, offset)[0]
+        offset += 2
+        if offset + extension_size != len(hello):
+            return None
+
+        extension_bytes = bytearray()
+        cursor = offset
+        extensions_end = offset + extension_size
+        found_extension = False
+        found_hostname = False
+        while cursor < extensions_end:
+            if cursor + 4 > extensions_end:
+                return None
+            extension_type, item_size = struct.unpack_from("!HH", hello, cursor)
+            if extension_type in (0xfe0d, 41):
+                # Changing the public name invalidates an ECH configuration, and
+                # changing any ClientHello byte invalidates a TLS 1.3 PSK binder.
+                return None
+            item_start = cursor + 4
+            item_end = item_start + item_size
+            if item_end > extensions_end:
+                return None
+            item = hello[item_start:item_end]
+            if extension_type == 0:
+                if found_extension or len(item) < 2:
+                    return None
+                found_extension = True
+                names_size = struct.unpack_from("!H", item, 0)[0]
+                if names_size != len(item) - 2:
+                    return None
+                names = bytearray()
+                name_cursor = 2
+                while name_cursor < len(item):
+                    if name_cursor + 3 > len(item):
+                        return None
+                    name_type = item[name_cursor]
+                    name_size = struct.unpack_from("!H", item, name_cursor + 1)[0]
+                    name_start = name_cursor + 3
+                    name_end = name_start + name_size
+                    if name_end > len(item):
+                        return None
+                    name = item[name_start:name_end]
+                    if name_type == 0:
+                        if found_hostname:
+                            return None
+                        found_hostname = True
+                        name = replacement
+                    names.extend(bytes([name_type]) + struct.pack("!H", len(name)) + name)
+                    name_cursor = name_end
+                if not found_hostname:
+                    return None
+                new_item = struct.pack("!H", len(names)) + names
+                extension_bytes.extend(struct.pack("!HH", extension_type, len(new_item)))
+                extension_bytes.extend(new_item)
+            else:
+                extension_bytes.extend(hello[cursor:item_end])
+            cursor = item_end
+
+        if not found_extension or not found_hostname:
+            return None
+        updated_hello = (hello[:extension_length_offset]
+                         + struct.pack("!H", len(extension_bytes))
+                         + bytes(extension_bytes))
+        return b"\x01" + len(updated_hello).to_bytes(3, "big") + updated_hello
+
+    def _pass_through(self):
+        self.done = True
+        data = bytes(self.buffer)
+        self.buffer.clear()
+        return data
+
+    def finish(self):
+        self.done = True
+        data = bytes(self.buffer)
+        self.buffer.clear()
+        return data
+
+
 class TunTcpFlow:
 
     def __init__(self, engine, key, info, segment):
@@ -2052,6 +2351,8 @@ class TunTcpFlow:
         options = tcp_options(segment["options"])
         default_mss = 1220 if self.version == 6 else 536
         self.mss = max(256, min(options["mss"] or default_mss, 1460))
+        if engine.tcp_max_segment_size:
+            self.mss = min(self.mss, engine.tcp_max_segment_size)
         self.use_window_scale = options["window_scale"] is not None
         self.peer_scale = options["window_scale"] or 0
         self.peer_window = max(segment["window"], self.mss)
@@ -2087,7 +2388,7 @@ class TunTcpFlow:
     def current_options(self, syn=False):
         options = bytearray()
         if syn:
-            options.extend(b"\x02\x04" + struct.pack("!H", 1220 if self.version == 6 else 1460))
+            options.extend(b"\x02\x04" + struct.pack("!H", self.mss))
             if self.use_sack:
                 options.extend(b"\x04\x02")
             if self.use_window_scale:
@@ -2247,18 +2548,47 @@ class TunTcpFlow:
                 self.track(asyncio.create_task(self.close_after_ack()))
 
     async def write_remote(self):
+        fragmenter = None
+        if self.engine.fragment_client_hello or self.engine.sni_override is not None:
+            fragmenter = TLSClientHelloProcessor(
+                self.engine.tls_fragment_size,
+                fragment=self.engine.fragment_client_hello,
+                sni_override=self.engine.sni_override,
+            )
         try:
             while not self.closed:
-                data = await self.write_queue.get()
+                if fragmenter is not None and fragmenter.pending:
+                    try:
+                        data = await asyncio.wait_for(self.write_queue.get(), timeout=3.0)
+                    except asyncio.TimeoutError:
+                        data = fragmenter.finish()
+                        fragmenter = None
+                        if data:
+                            self.writer.write(data)
+                            await self.writer.drain()
+                        continue
+                else:
+                    data = await self.write_queue.get()
                 if data is None:
+                    if fragmenter is not None:
+                        buffered = fragmenter.finish()
+                        fragmenter = None
+                        if buffered:
+                            self.writer.write(buffered)
+                            await self.writer.drain()
                     if self.writer.can_write_eof():
                         self.writer.write_eof()
                         await self.writer.drain()
                     else:
                         close_writer(self.writer)
                     return
-                self.writer.write(data)
-                await self.writer.drain()
+                if fragmenter is not None:
+                    data = fragmenter.feed(data)
+                    if fragmenter.done:
+                        fragmenter = None
+                if data:
+                    self.writer.write(data)
+                    await self.writer.drain()
         except (ConnectionError, OSError):
             if not self.closed:
                 await self.send_reset()
@@ -2350,7 +2680,8 @@ class Tun2Socks:
 
     def __init__(self, tun, proxy, username=None, password=None, connect_timeout=20,
                  tcp_idle_timeout=600, udp_idle_timeout=120, retransmit_limit=8,
-                 udp_over_tcp=False, dns_redirect=None):
+                 udp_over_tcp=False, dns_redirect=None, tcp_max_segment_size=None,
+                 fragment_client_hello=None, tls_fragment_size=None, sni_override=None):
         if isinstance(tun, PseudoTun):
             tun = tun.tunnel
         self.tun = tun
@@ -2362,6 +2693,18 @@ class Tun2Socks:
         self.retransmit_limit = retransmit_limit
         self.udp_over_tcp = bool(udp_over_tcp)
         self.dns_redirect = dns_redirect
+        self.tcp_max_segment_size = int(
+            TCP_MICROSEGMENT_SIZE if tcp_max_segment_size is None else tcp_max_segment_size)
+        if self.tcp_max_segment_size and not 256 <= self.tcp_max_segment_size <= 1460:
+            raise ValueError("TCP max segment size must be 0 or between 256 and 1460 bytes")
+        self.fragment_client_hello = bool(
+            TLS_CLIENT_HELLO_FRAGMENTATION if fragment_client_hello is None
+            else fragment_client_hello)
+        self.tls_fragment_size = int(
+            TLS_CLIENT_HELLO_FRAGMENT_SIZE if tls_fragment_size is None else tls_fragment_size)
+        if not 64 <= self.tls_fragment_size <= 1024:
+            raise ValueError("TLS ClientHello fragment size must be between 64 and 1024 bytes")
+        self.sni_override = normalize_sni_override(sni_override)
         self.tcp_flows = {}
         self.udp_flows = {}
         self.dns_flows = {}

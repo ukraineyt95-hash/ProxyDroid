@@ -38,6 +38,11 @@ class AndroidRunnerLifecycleTest(unittest.TestCase):
             "dnsUpstream": "1.1.1.1:53",
             "fakeIpRange": "198.18.0.0/15",
             "udpOverTcp": True,
+            "tcpMaxSegmentSize": 512,
+            "tcpFastOpen": True,
+            "fragmentClientHello": True,
+            "tlsFragmentSize": 128,
+            "sniOverride": "www.cloudflare.com",
         }
         try:
             self.assertTrue(android_runner.start(left.fileno(), config))

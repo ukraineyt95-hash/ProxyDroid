@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import java.net.IDN
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
@@ -28,6 +29,13 @@ data class ProxySettings(
     val dnsUpstream: String = "1.1.1.1:53",
     val fakeIpRange: String = "198.18.0.0/15",
     val udpOverTcp: Boolean = false,
+    val tcpMicroSegmentation: Boolean = false,
+    val tcpSegmentSize: String = "512",
+    val fragmentTlsClientHello: Boolean = false,
+    val tlsFragmentSize: String = "128",
+    val tcpFastOpen: Boolean = false,
+    val sniOverrideEnabled: Boolean = false,
+    val sniOverride: String = "",
 ) {
     fun validationError(): String? {
         if (host.isBlank() || host.any(Char::isWhitespace)) {
@@ -67,6 +75,32 @@ data class ProxySettings(
         if (!fakeIpRange.matches(Regex("\\d{1,3}(\\.\\d{1,3}){3}/\\d{1,2}"))) {
             return "Fake-IP диапазон должен быть IPv4-сетью, например 198.18.0.0/15."
         }
+        if (tcpMicroSegmentation) {
+            val mss = tcpSegmentSize.toIntOrNull()
+            if (mss == null || mss !in 256..1460) {
+                return "Размер TCP-сегмента должен быть числом от 256 до 1460 байт."
+            }
+        }
+        if (fragmentTlsClientHello) {
+            val fragmentSize = tlsFragmentSize.toIntOrNull()
+            if (fragmentSize == null || fragmentSize !in 64..1024) {
+                return "Размер фрагмента ClientHello должен быть числом от 64 до 1024 байт."
+            }
+        }
+        if (sniOverrideEnabled) {
+            val asciiName = runCatching {
+                IDN.toASCII(sniOverride.trim(), IDN.USE_STD3_ASCII_RULES).lowercase()
+            }.getOrNull()
+            val validLabels = asciiName?.split('.')?.all { label ->
+                label.length in 1..63 &&
+                    label.first().isLetterOrDigit() && label.last().isLetterOrDigit() &&
+                    label.all { it.isLetterOrDigit() || it == '-' }
+            } == true
+            if (asciiName.isNullOrBlank() || asciiName.length > 253 || !validLabels ||
+                asciiName.matches(Regex("\\d{1,3}(\\.\\d{1,3}){3}"))) {
+                return "Укажите SNI как DNS-имя без схемы, порта и IP-адреса, например www.example.com."
+            }
+        }
         return null
     }
 
@@ -91,6 +125,15 @@ data class ProxySettings(
         "dnsUpstream" to dnsUpstream.trim(),
         "fakeIpRange" to fakeIpRange.trim(),
         "udpOverTcp" to udpOverTcp,
+        "tcpMaxSegmentSize" to if (tcpMicroSegmentation) {
+            tcpSegmentSize.toIntOrNull() ?: 512
+        } else {
+            0
+        },
+        "tcpFastOpen" to tcpFastOpen,
+        "fragmentClientHello" to fragmentTlsClientHello,
+        "tlsFragmentSize" to (tlsFragmentSize.toIntOrNull() ?: 128),
+        "sniOverride" to if (sniOverrideEnabled) sniOverride.trim() else "",
     )
 
     private fun validProxyAddress(value: String): Boolean {
@@ -158,6 +201,13 @@ class ProxySettingsStore(context: Context) {
             fakeIpRange = preferences.getString("fakeIpRange", "198.18.0.0/15")
                 ?: "198.18.0.0/15",
             udpOverTcp = preferences.getBoolean("udpOverTcp", false),
+            tcpMicroSegmentation = preferences.getBoolean("tcpMicroSegmentation", false),
+            tcpSegmentSize = preferences.getString("tcpSegmentSize", "512") ?: "512",
+            fragmentTlsClientHello = preferences.getBoolean("fragmentTlsClientHello", false),
+            tlsFragmentSize = preferences.getString("tlsFragmentSize", "128") ?: "128",
+            tcpFastOpen = preferences.getBoolean("tcpFastOpen", false),
+            sniOverrideEnabled = preferences.getBoolean("sniOverrideEnabled", false),
+            sniOverride = preferences.getString("sniOverride", "") ?: "",
         )
         // Persist generated credentials immediately. Otherwise the first-run UI could
         // claim settings are saved while each load silently creates a new password.
@@ -185,6 +235,13 @@ class ProxySettingsStore(context: Context) {
             .putString("dnsUpstream", settings.dnsUpstream.trim())
             .putString("fakeIpRange", settings.fakeIpRange.trim())
             .putBoolean("udpOverTcp", settings.udpOverTcp)
+            .putBoolean("tcpMicroSegmentation", settings.tcpMicroSegmentation)
+            .putString("tcpSegmentSize", settings.tcpSegmentSize.trim())
+            .putBoolean("fragmentTlsClientHello", settings.fragmentTlsClientHello)
+            .putString("tlsFragmentSize", settings.tlsFragmentSize.trim())
+            .putBoolean("tcpFastOpen", settings.tcpFastOpen)
+            .putBoolean("sniOverrideEnabled", settings.sniOverrideEnabled)
+            .putString("sniOverride", settings.sniOverride.trim())
             .apply()
     }
 
